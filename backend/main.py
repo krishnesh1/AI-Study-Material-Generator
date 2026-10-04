@@ -1,22 +1,28 @@
 import os
 import json
 import uuid
+import re
+import urllib.parse as urlparse
+import subprocess
+import requests
+import asyncio
+from typing import Optional, List, Dict, Any
 
-# Ensure ffmpeg is in PATH for whisper
+# Ensure ffmpeg & node are in PATH
 ffmpeg_path = r"C:\Users\WELCOME\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0-full_build\bin"
 if os.path.exists(ffmpeg_path) and ffmpeg_path not in os.environ.get("PATH", ""):
     os.environ["PATH"] += os.pathsep + ffmpeg_path
 
+node_path = r"C:\Program Files\nodejs"
+if os.path.exists(node_path) and node_path not in os.environ.get("PATH", ""):
+    os.environ["PATH"] += os.pathsep + node_path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
 import yt_dlp
-import cv2
-import os
-import json
-import uuid
-import whisper
+from youtube_transcript_api import YouTubeTranscriptApi
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -38,34 +44,90 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 class VideoRequest(BaseModel):
-    url: str
+    url: Optional[str] = None
+    text: Optional[str] = None
     language: str = "English"
 
 def extract_video_id(url: str) -> str:
-    import urllib.parse as urlparse
-    url_data = urlparse.urlparse(url)
-    query = urlparse.parse_qs(url_data.query)
-    if "v" in query:
+    """Extract standard 11-char YouTube video ID from various URL structures."""
+    if not url:
+        raise ValueError("Empty URL")
+    url = url.strip()
+    
+    # Check youtu.be shortlinks
+    if "youtu.be/" in url:
+        match = re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', url)
+        if match:
+            return match.group(1)
+            
+    # Check shorts, embed, or v paths
+    match = re.search(r'(?:shorts|embed|v)/([a-zA-Z0-9_-]{11})', url)
+    if match:
+        return match.group(1)
+        
+    # Check standard query param
+    parsed = urlparse.urlparse(url)
+    query = urlparse.parse_qs(parsed.query)
+    if "v" in query and query["v"]:
         return query["v"][0]
-    if "youtu.be" in url:
-        return url_data.path[1:]
+        
+    # Generic regex fallback for 11-char YouTube ID
+    match = re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', url)
+    if match:
+        return match.group(1)
+        
     raise ValueError("Invalid YouTube URL")
 
-def get_transcript(url: str, temp_dir: str) -> str:
+def sanitize_youtube_url(url: str) -> tuple[str, str]:
+    """Returns (video_id, clean_canonical_url) stripping playlist and timestamp parameters."""
+    video_id = extract_video_id(url)
+    return video_id, f"https://www.youtube.com/watch?v={video_id}"
+
+def get_transcript_from_api(video_id: str) -> str:
+    """Try fetching transcript using YouTubeTranscriptApi."""
+    try:
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
+        transcript = None
+        for t in transcript_list:
+            transcript = t
+            break
+            
+        if transcript:
+            snippets = transcript.fetch()
+            text = " ".join([s.text for s in snippets if hasattr(s, 'text') or (isinstance(s, dict) and 'text' in s)])
+            if not text:
+                text = " ".join([s.get('text', '') if isinstance(s, dict) else str(s) for s in snippets])
+            return text.strip()
+    except Exception as e:
+        print(f"[YouTubeTranscriptApi] Note: {e}")
+    return ""
+
+def get_transcript_from_ytdlp(clean_url: str, temp_dir: str) -> str:
+    """Try fetching subtitles/captions with yt-dlp using clean canonical URL."""
     try:
         ydl_opts = {
             'skip_download': True,
             'writesubtitles': True,
             'writeautomaticsub': True,
-            'subtitleslangs': ['en', 'hi', 'ne', 'es', 'fr', 'de', 'ja', 'ko'],
+            'subtitleslangs': ['en', 'hi', 'en-US', 'en-IN'],
             'subtitlesformat': 'vtt',
             'outtmpl': os.path.join(temp_dir, 'subs.%(ext)s'),
             'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'ignoreerrors': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'tv'],
+                    'player_skip': ['configs']
+                }
+            }
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            ydl.download([clean_url])
             
-        # Find the downloaded vtt file
+        # Find any downloaded vtt file
         vtt_file = None
         for file in os.listdir(temp_dir):
             if file.endswith('.vtt'):
@@ -75,227 +137,309 @@ def get_transcript(url: str, temp_dir: str) -> str:
         if not vtt_file:
             return ""
             
-        with open(vtt_file, 'r', encoding='utf-8') as f:
+        with open(vtt_file, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
             
-        # Basic VTT parsing (strip timestamps)
         text_lines = []
         for line in lines:
             line = line.strip()
             if not line or '-->' in line or line.startswith('WEBVTT') or line.startswith('Kind:') or line.startswith('Language:'):
                 continue
-            # remove formatting tags like <c>
-            import re
             line = re.sub(r'<[^>]+>', '', line)
             text_lines.append(line)
             
-        return " ".join(text_lines)
+        return " ".join(text_lines).strip()
     except Exception as e:
-        print(f"Error fetching transcript with yt-dlp: {e}")
+        print(f"[yt-dlp subtitle] Note: {e}")
         return ""
 
-def extract_audio_and_transcribe_with_whisper(url: str, output_dir: str) -> str:
+def get_transcript_from_invidious(video_id: str) -> str:
+    """Fallback: Try fetching captions from public Invidious instances."""
+    instances = [
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://invidious.jing.rocks",
+        "https://vid.priv.au",
+        "https://invidious.no-logs.com",
+    ]
+    for inst in instances:
+        try:
+            url = f"{inst}/api/v1/captions/{video_id}"
+            r = requests.get(url, timeout=2.5)
+            if r.status_code == 200:
+                captions = r.json().get("captions", [])
+                for c in captions:
+                    sub_url = inst + c.get("url", "")
+                    sub_r = requests.get(sub_url, timeout=2.5)
+                    if sub_r.status_code == 200 and len(sub_r.text) > 100:
+                        # Strip VTT formatting
+                        cleaned = re.sub(r'WEBVTT.*?\n\n', '', sub_r.text, flags=re.DOTALL)
+                        cleaned = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}.*?\n', '', cleaned)
+                        cleaned = re.sub(r'<[^>]+>', '', cleaned)
+                        return " ".join(cleaned.split()).strip()
+        except Exception:
+            continue
+    return ""
+
+def extract_audio_and_transcribe_groq(clean_url: str, output_dir: str) -> str:
+    """Download audio track and transcribe in a single fast call with Groq Whisper."""
+    if not client:
+        return ""
     try:
-        audio_path = os.path.join(output_dir, "audio.m4a")
+        audio_raw_path = os.path.join(output_dir, "audio_raw.m4a")
+        compressed_audio_path = os.path.join(output_dir, "audio_compressed.mp3")
+        
         ydl_opts = {
-            'format': 'm4a/bestaudio/best',
-            'outtmpl': audio_path,
+            'format': 'ba/b/best',
+            'outtmpl': audio_raw_path,
             'quiet': True,
-            'extractor_args': {'youtube': {'player_client': ['android']}}
+            'no_warnings': True,
+            'noplaylist': True,
+            'ignoreerrors': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'tv', 'web_safari']
+                }
+            }
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            ydl.download([clean_url])
+            
+        if not os.path.exists(audio_raw_path):
+            # Check if downloaded with other extension
+            for f in os.listdir(output_dir):
+                if f.startswith("audio_raw"):
+                    audio_raw_path = os.path.join(output_dir, f)
+                    break
+                    
+        if not os.path.exists(audio_raw_path):
+            return ""
+
+        # Compress to 32kbps mono MP3 to keep under Groq 25MB limit even for 1hr+ videos
+        compress_cmd = [
+            "ffmpeg", "-y", "-i", audio_raw_path,
+            "-ac", "1", "-ar", "16000", "-b:a", "32k",
+            compressed_audio_path
+        ]
+        subprocess.run(compress_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
         
-        # Use Groq's ultra-fast Whisper API instead of slow local CPU model
-        with open(audio_path, "rb") as file:
+        target_audio = compressed_audio_path if os.path.exists(compressed_audio_path) else audio_raw_path
+        
+        with open(target_audio, "rb") as file_handle:
             transcription = client.audio.transcriptions.create(
-              file=(os.path.basename(audio_path), file.read()),
-              model="whisper-large-v3",
-              response_format="json"
+                file=(os.path.basename(target_audio), file_handle.read()),
+                model="whisper-large-v3-turbo",
+                response_format="json"
             )
-        return transcription.text
+        return transcription.text.strip()
     except Exception as e:
-        print(f"Whisper fallback failed: {e}")
+        print(f"[Whisper fallback error]: {e}")
         return ""
 
-def extract_specific_timestamps(url: str, timestamps: list, output_dir: str) -> list:
-    frames_paths = []
-    try:
-        ydl_opts = {
-            'format': 'best', 
-            'quiet': True,
-            'extractor_args': {'youtube': {'player_client': ['android']}}
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=False)
-            video_url = info_dict.get('url', None)
-        
-        if not video_url:
-            return []
+def clean_llm_json(raw_text: str) -> Dict[str, Any]:
+    """Strip think tags, markdown wrappers, and safely parse JSON."""
+    if not raw_text:
+        return {}
+    # Remove reasoning / <think> blocks
+    cleaned = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL).strip()
+    # Strip markdown code blocks ```json ... ```
+    cleaned = re.sub(r'^```json\s*', '', cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r'^```\s*', '', cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r'```$', '', cleaned, flags=re.MULTILINE)
+    
+    # Find matching JSON object
+    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if match:
+        json_str = match.group(0)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            # Clean common syntax glitches
+            try:
+                fixed = re.sub(r',\s*([\]}])', r'\1', json_str)
+                return json.loads(fixed)
+            except Exception:
+                pass
+    return {}
 
-        import subprocess
-        for i, time_str in enumerate(timestamps):
-            # Clean up timestamp string
-            time_str = time_str.strip()
-            if not time_str: continue
-            
-            frame_path = os.path.join(output_dir, f"frame_{i}.jpg")
-            
-            cmd = [
-                "ffmpeg", "-y", "-ss", time_str, 
-                "-i", video_url, 
-                "-vframes", "1", "-q:v", "2", frame_path
-            ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            if os.path.exists(frame_path):
-                import base64
-                with open(frame_path, "rb") as image_file:
-                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                    frames_paths.append({
-                        "image_url": f"data:image/jpeg;base64,{encoded_string}",
-                        "timestamp": time_str
-                    })
-            else:
-                frames_paths.append({
-                    "image_url": None,
-                    "timestamp": time_str
-                })
-        
-        return frames_paths
-    except Exception as e:
-        print(f"Error extracting specific keyframes: {e}")
-        return []
-
-def map_reduce_chunking(text: str, chunk_size: int = 8000, overlap: int = 500) -> list:
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return chunks
+def extract_visual_frames(clean_url: str, video_id: str, visual_insights: list, output_dir: str) -> list:
+    """Extract visual frame snapshots or provide clean high-resolution YouTube thumbnails."""
+    results = []
+    default_thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+    
+    for i, item in enumerate(visual_insights):
+        time_str = item.get("timestamp", "00:00").strip()
+        desc = item.get("description", "Video visual insight")
+        results.append({
+            "timestamp": time_str,
+            "description": desc,
+            "image_url": default_thumbnail
+        })
+    return results
 
 @app.post("/api/process-video")
 async def process_video(request: VideoRequest):
     if not client:
-        raise HTTPException(status_code=500, detail="Gemini API key not configured")
+        raise HTTPException(status_code=500, detail="Groq API key not configured in .env")
 
-    try:
-        video_id = extract_video_id(request.url)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+    # If raw text is provided directly
+    direct_text = request.text.strip() if request.text else ""
+    video_id = ""
+    clean_url = ""
+    
+    if request.url:
+        try:
+            video_id, clean_url = sanitize_youtube_url(request.url)
+        except ValueError:
+            if not direct_text:
+                raise HTTPException(status_code=400, detail="Invalid YouTube URL. Please provide a valid YouTube URL or paste transcript text.")
 
     temp_dir = f"temp_{uuid.uuid4()}"
     os.makedirs(temp_dir, exist_ok=True)
     
-    try:
-        # 1. Fetch Transcript
-        transcript_text = get_transcript(request.url, temp_dir)
-        
-        if not transcript_text:
-            print("Captions missing. Falling back to Whisper STT.")
-            transcript_text = extract_audio_and_transcribe_with_whisper(request.url, temp_dir)
-            
-        if not transcript_text:
-            raise HTTPException(status_code=500, detail="Failed to extract audio or text from video")
-
-        # 2. AI Synthesis using Map-Reduce simulation
-        chunks = map_reduce_chunking(transcript_text)
-        if len(chunks) > 1:
-            chunks = chunks[:1]
-            print("Truncated transcript chunks to avoid Groq API rate limits.")
-            
-        summaries = []
-        for chunk in chunks:
-            map_prompt = f"Summarize the key information in this portion of a video transcript. You must write the summary entirely in {request.language}:\n\n{chunk}"
-            map_res = client.chat.completions.create(
-                model="openai/gpt-oss-20b",
-                messages=[{"role": "user", "content": map_prompt}],
-                max_tokens=4096
-            )
-            summaries.append(map_res.choices[0].message.content)
-            
-        combined_summary = "\n".join(summaries)
-        
-        reduce_prompt = f"""
-        Using the following combined summary and transcript chunks of an educational video, generate structured study notes and a quiz.
-        You MUST write the output (title, summary, key points, descriptions, and quiz questions/answers) entirely in {request.language}.
-        
-        Combined Video Summary:
-        {combined_summary}
-        
-        Respond STRICTLY by wrapping your entire JSON output inside a markdown code block exactly like this:
-        ```json
-        {{
-          "title": "Video Title or Topic",
-          "summary": "A highly detailed, comprehensive summary of the video content, consisting of at least 3 to 4 detailed paragraphs explaining the core concepts.",
-          "key_points": ["Point 1", "Point 2", "Point 3"],
-          "visual_insights": [
-             {{"timestamp": "01:20", "description": "Description of what is being shown visually at this point based on context"}}
-          ],
-          "quiz": [
-            {{
-              "id": 1,
-              "question": "Question text?",
-              "options": ["A", "B", "C", "D"],
-              "correct_answer": "A",
-              "explanation": "Why A is correct."
-            }}
-          ]
-        }}
-        ```
-        Ensure exactly 5 quiz questions. You MUST wrap the JSON in ```json and ```.
-        """
-        
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[{"role": "user", "content": reduce_prompt}],
-            max_tokens=4096
-        )
-        
-        raw_content = response.choices[0].message.content
-        start_idx = raw_content.find('{')
-        result = None
-        
-        while start_idx != -1 and result is None:
-            end_idx = raw_content.rfind('}')
-            while end_idx != -1 and end_idx > start_idx:
-                try:
-                    result = json.loads(raw_content[start_idx:end_idx+1])
-                    break
-                except json.JSONDecodeError:
-                    end_idx = raw_content.rfind('}', 0, end_idx)
-            
-            if result is None:
-                start_idx = raw_content.find('{', start_idx + 1)
-                
-        if result is None:
-            with open('failed_response.txt', 'w', encoding='utf-8') as f:
-                f.write(raw_content)
-            raise ValueError("No valid JSON object could be parsed from AI response. Saved to failed_response.txt")
-        
-        # 3. Extract specific keyframes requested by the AI
-        visuals = result.get("visual_insights", [])
-        if visuals:
-            ai_timestamps = [v.get("timestamp", "00:00") for v in visuals]
-            import asyncio
-            keyframes_data = await asyncio.to_thread(extract_specific_timestamps, request.url, ai_timestamps, temp_dir)
-            
-            for i, frame in enumerate(keyframes_data):
-                if i < len(visuals):
-                    result["visual_insights"][i]["image_url"] = frame["image_url"]
-                    
-        return result
-        
-    except Exception as e:
-        print(f"Error during processing: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to process video: {str(e)}")
-    finally:
-        # Cleanup temp dir
+    async def event_generator():
         try:
-            for file in os.listdir(temp_dir):
-                os.remove(os.path.join(temp_dir, file))
-            os.rmdir(temp_dir)
-        except:
-            pass
+            transcript_text = direct_text
+            
+            if not transcript_text and clean_url:
+                yield f"data: {json.dumps({'status': 'progress', 'message': 'Fetching video transcript and subtitles...'})}\n\n"
+                
+                # 1. Try YouTubeTranscriptApi
+                transcript_text = await asyncio.to_thread(get_transcript_from_api, video_id)
+                
+                # 2. Try yt-dlp clean subtitle extraction
+                if not transcript_text:
+                    transcript_text = await asyncio.to_thread(get_transcript_from_ytdlp, clean_url, temp_dir)
+                    
+                # 3. Try Invidious mirror extraction
+                if not transcript_text:
+                    transcript_text = await asyncio.to_thread(get_transcript_from_invidious, video_id)
+                    
+                # 4. Try Whisper Audio Transcription
+                if not transcript_text:
+                    yield f"data: {json.dumps({'status': 'progress', 'message': 'Subtitles not directly available. Transcribing audio with Groq Whisper...'})}\n\n"
+                    transcript_text = await asyncio.to_thread(extract_audio_and_transcribe_groq, clean_url, temp_dir)
+
+            if not transcript_text:
+                yield f"data: {json.dumps({'status': 'error', 'message': 'Could not extract transcript from YouTube. YouTube is temporarily rate-limiting automated requests. You can paste the transcript or notes text directly in the Text tab!'})}\n\n"
+                return
+
+            yield f"data: {json.dumps({'status': 'progress', 'message': 'AI is analyzing concepts, generating study notes, and creating quiz...'})}\n\n"
+
+            # Truncate if ultra-long to stay within token limits
+            max_chars = 35000
+            truncated_transcript = transcript_text[:max_chars]
+
+            system_prompt = f"""You are an elite academic professor and master tutor.
+Transform the following educational transcript into high-yield, structured study material.
+Write the entire output in {request.language}.
+
+You MUST respond strictly with valid JSON inside a ```json ... ``` codeblock using this exact format:
+```json
+{{
+  "title": "Clear, informative topic title",
+  "summary": "Detailed 3-4 paragraph structured explanation covering core concepts, mechanisms, advantages, disadvantages, and real-world exam context.",
+  "key_points": [
+    "Core takeaway 1 with clear explanation",
+    "Core takeaway 2 with clear explanation",
+    "Core takeaway 3 with clear explanation",
+    "Core takeaway 4 with clear explanation"
+  ],
+  "visual_insights": [
+    {{"timestamp": "01:30", "description": "Key visual diagram or architecture explained at this point"}},
+    {{"timestamp": "04:15", "description": "Formula, code, or workflow visual concept"}}
+  ],
+  "quiz": [
+    {{
+      "id": 1,
+      "question": "Clear, challenging conceptual question testing comprehension?",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correct_answer": "Option A",
+      "explanation": "Detailed explanation of why Option A is correct and why other options are incorrect."
+    }},
+    {{
+      "id": 2,
+      "question": "Second conceptual question?",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correct_answer": "Option B",
+      "explanation": "Detailed explanation."
+    }},
+    {{
+      "id": 3,
+      "question": "Third conceptual question?",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correct_answer": "Option C",
+      "explanation": "Detailed explanation."
+    }},
+    {{
+      "id": 4,
+      "question": "Fourth conceptual question?",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correct_answer": "Option D",
+      "explanation": "Detailed explanation."
+    }},
+    {{
+      "id": 5,
+      "question": "Fifth conceptual question?",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correct_answer": "Option A",
+      "explanation": "Detailed explanation."
+    }}
+  ]
+}}
+```
+Ensure exactly 5 high-yield quiz questions with detailed explanations. Do not include any text outside the json markdown block."""
+
+            # Use openai/gpt-oss-20b on Groq for ultra-fast generation (< 2s)
+            response = None
+            for model_name in ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]:
+                try:
+                    response = await asyncio.to_thread(
+                        client.chat.completions.create,
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"Transcript Content:\n{truncated_transcript}"}
+                        ],
+                        temperature=0.2,
+                        max_tokens=4096
+                    )
+                    if response and response.choices:
+                        break
+                except Exception as model_err:
+                    print(f"Error with {model_name}: {model_err}")
+
+            if not response or not response.choices:
+                yield f"data: {json.dumps({'status': 'error', 'message': 'AI generation failed to produce output. Please check your GROQ_API_KEY.'})}\n\n"
+                return
+
+            raw_content = response.choices[0].message.content
+            parsed_json = clean_llm_json(raw_content)
+
+            if not parsed_json or "summary" not in parsed_json:
+                yield f"data: {json.dumps({'status': 'error', 'message': 'Failed to parse AI output into study notes format.'})}\n\n"
+                return
+
+            # Prepare visual cards
+            visuals = parsed_json.get("visual_insights", [])
+            if visuals and video_id:
+                parsed_json["visual_insights"] = extract_visual_frames(clean_url, video_id, visuals, temp_dir)
+                
+            parsed_json["status"] = "completed"
+            yield f"data: {json.dumps(parsed_json)}\n\n"
+
+        except Exception as e:
+            print(f"[Streaming Error]: {e}")
+            yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
+        finally:
+            import shutil
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

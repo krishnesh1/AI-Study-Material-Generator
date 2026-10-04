@@ -8,3 +8,5 @@ google-genai
 python-dotenv
 python-multipart
 openai-whisper
+curl-cffi
+nodejs-bin  

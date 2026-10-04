@@ -19,3 +19,8 @@ failed_response.txt
 # OS
 .DS_Store
 Thumbs.db
+
+*.m4a
+*.vtt
+*.jpg
+*.part
