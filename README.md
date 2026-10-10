@@ -1,5 +1,7 @@
 # AI-Powered Study Material Generator 🚀
 
+**🌍 Live Demo:** [Frontend (Vercel)](https://ai-study-material-generator-nine.vercel.app/) | **⚙️ Backend API:** [Render](https://ai-study-material-generator-ljl8.onrender.com/)
+
 An incredibly powerful, full-stack Next.js and FastAPI application that uses multimodality to turn any YouTube video into comprehensive study notes, interactive quizzes, and precision-extracted visual flashcards.
 
 ## Features ✨

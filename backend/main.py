@@ -107,6 +107,7 @@ def get_transcript_from_ytdlp(clean_url: str, temp_dir: str) -> str:
     """Try fetching subtitles/captions with yt-dlp using clean canonical URL."""
     try:
         ydl_opts = {
+            'impersonate': 'chrome',
             'skip_download': True,
             'writesubtitles': True,
             'writeautomaticsub': True,
@@ -190,6 +191,7 @@ def extract_audio_and_transcribe_groq(clean_url: str, output_dir: str) -> str:
         compressed_audio_path = os.path.join(output_dir, "audio_compressed.mp3")
         
         ydl_opts = {
+            'impersonate': 'chrome',
             'format': 'ba/b/best',
             'outtmpl': audio_raw_path,
             'quiet': True,
