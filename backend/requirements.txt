@@ -3,10 +3,10 @@ uvicorn
 pydantic
 youtube-transcript-api
 yt-dlp
-opencv-python
+opencv-python-headless
 google-genai
 python-dotenv
 python-multipart
-openai-whisper
 curl-cffi
-nodejs-bin  
+groq
+requests

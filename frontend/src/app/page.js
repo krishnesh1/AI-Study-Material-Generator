@@ -74,7 +74,8 @@ export default function Home() {
         ...(inputMode === "url" ? { url: url.trim() } : { text: text.trim() })
       };
 
-      const response = await fetch("http://127.0.0.1:8000/api/process-video", {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+      const response = await fetch(`${apiUrl}/api/process-video`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

@@ -8,14 +8,8 @@ import requests
 import asyncio
 from typing import Optional, List, Dict, Any
 
-# Ensure ffmpeg & node are in PATH
-ffmpeg_path = r"C:\Users\WELCOME\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0-full_build\bin"
-if os.path.exists(ffmpeg_path) and ffmpeg_path not in os.environ.get("PATH", ""):
-    os.environ["PATH"] += os.pathsep + ffmpeg_path
-
-node_path = r"C:\Program Files\nodejs"
-if os.path.exists(node_path) and node_path not in os.environ.get("PATH", ""):
-    os.environ["PATH"] += os.pathsep + node_path
+# In production, ensure ffmpeg and node are installed on the host and in the system PATH.
+# The Dockerfile handles this automatically.
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +32,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+@app.get("/health")
+def health_check():
+    """Health check endpoint to keep the Render server awake."""
+    return {"status": "ok", "message": "Backend is running!"}
 
 # Initialize Groq Client
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -263,17 +263,59 @@ def clean_llm_json(raw_text: str) -> Dict[str, Any]:
     return {}
 
 def extract_visual_frames(clean_url: str, video_id: str, visual_insights: list, output_dir: str) -> list:
-    """Extract visual frame snapshots or provide clean high-resolution YouTube thumbnails."""
+    """Extract visual frame snapshots using yt-dlp and ffmpeg."""
+    import base64
     results = []
     default_thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+    
+    stream_url = None
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4]/best',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'tv', 'web_safari']
+            }
+        }
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(clean_url, download=False)
+            stream_url = info.get('url', None)
+    except Exception as e:
+        print(f"[yt-dlp extract_info error]: {e}")
     
     for i, item in enumerate(visual_insights):
         time_str = item.get("timestamp", "00:00").strip()
         desc = item.get("description", "Video visual insight")
+        image_url = default_thumbnail
+        
+        if stream_url:
+            try:
+                frame_path = os.path.join(output_dir, f"frame_{i}.jpg")
+                cmd = [
+                    "ffmpeg", "-y", "-ss", time_str,
+                    "-i", stream_url,
+                    "-vframes", "1",
+                    "-q:v", "2",
+                    frame_path
+                ]
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                
+                if os.path.exists(frame_path):
+                    with open(frame_path, "rb") as f:
+                        encoded = base64.b64encode(f.read()).decode("utf-8")
+                        image_url = f"data:image/jpeg;base64,{encoded}"
+            except Exception as e:
+                print(f"[ffmpeg extract frame error]: {e}")
+
         results.append({
             "timestamp": time_str,
             "description": desc,
-            "image_url": default_thumbnail
+            "image_url": image_url
         })
     return results
 
