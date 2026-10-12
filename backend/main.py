@@ -6,10 +6,9 @@ import urllib.parse as urlparse
 import subprocess
 import requests
 import asyncio
+import html
+import xml.etree.ElementTree as ET
 from typing import Optional, List, Dict, Any
-
-# In production, ensure ffmpeg and node are installed on the host and in the system PATH.
-# The Dockerfile handles this automatically.
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,10 +17,41 @@ from pydantic import BaseModel
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 from youtube_transcript_api import YouTubeTranscriptApi
+from curl_cffi import requests as cffi_requests
+from curl_cffi.requests import Session as CffiSession
 from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Proxy and Cookies configuration for cloud deployment (e.g. Render, Railway)
+PROXY_URL = os.environ.get("YOUTUBE_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY") or None
+COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES", "").strip()
+COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+
+def get_proxy_dict() -> Optional[Dict[str, str]]:
+    """Return dictionary of proxies if configured in environment."""
+    if PROXY_URL:
+        return {"http": PROXY_URL, "https": PROXY_URL}
+    return None
+
+def setup_cookies(temp_dir: str) -> Optional[str]:
+    """Return path to a valid cookies file if configured via env or file."""
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        return COOKIES_FILE
+    local_cookies = os.path.join(os.path.dirname(__file__), "cookies.txt")
+    if os.path.exists(local_cookies):
+        return local_cookies
+    if COOKIES_ENV:
+        cookie_path = os.path.join(temp_dir, "cookies.txt")
+        try:
+            with open(cookie_path, "w", encoding="utf-8") as f:
+                f.write(COOKIES_ENV)
+            return cookie_path
+        except Exception:
+            pass
+    return None
+
 
 app = FastAPI(title="Multimodal AI Video to Study Notes Generator")
 
@@ -84,16 +114,89 @@ def sanitize_youtube_url(url: str) -> tuple[str, str]:
     video_id = extract_video_id(url)
     return video_id, f"https://www.youtube.com/watch?v={video_id}"
 
-def get_transcript_from_api(video_id: str) -> str:
-    """Try fetching transcript using YouTubeTranscriptApi."""
+def get_transcript_from_innertube(video_id: str, cookies_path: Optional[str] = None) -> str:
+    """Fast direct transcript extraction via YouTube Innertube API using curl_cffi Chrome impersonation."""
     try:
-        api = YouTubeTranscriptApi()
+        sess_kwargs = {"impersonate": "chrome"}
+        proxy_dict = get_proxy_dict()
+        if proxy_dict:
+            sess_kwargs["proxies"] = proxy_dict
+        sess = cffi_requests.Session(**sess_kwargs)
+
+        r = sess.get(f"https://www.youtube.com/watch?v={video_id}", timeout=6)
+        if r.status_code != 200:
+            return ""
+            
+        key_match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', r.text)
+        api_key = key_match.group(1) if key_match else None
+        if not api_key:
+            return ""
+            
+        player_url = f"https://www.youtube.com/youtubei/v1/player?key={api_key}"
+        payload = {
+            "context": {
+                "client": {
+                    "clientName": "ANDROID",
+                    "clientVersion": "20.10.38"
+                }
+            },
+            "videoId": video_id
+        }
+        r_player = sess.post(player_url, json=payload, timeout=6)
+        if r_player.status_code != 200:
+            return ""
+            
+        data = r_player.json()
+        tracks = data.get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+        if not tracks:
+            return ""
+            
+        # Prioritize English caption track if present, otherwise first available
+        target_track = tracks[0]
+        for t in tracks:
+            lc = t.get("languageCode", "").lower()
+            if lc.startswith("en"):
+                target_track = t
+                break
+                
+        base_url = target_track.get("baseUrl")
+        if not base_url:
+            return ""
+            
+        r_subs = sess.get(base_url, timeout=6)
+        if r_subs.status_code != 200 or not r_subs.text:
+            return ""
+            
+        root = ET.fromstring(r_subs.text)
+        lines = []
+        for elem in root.iter('p'):
+            snippet = "".join(elem.itertext()).strip()
+            if snippet:
+                lines.append(html.unescape(snippet))
+        return " ".join(lines).strip()
+    except Exception as e:
+        print(f"[Innertube Direct] Note: {e}")
+        return ""
+
+def get_transcript_from_api(video_id: str) -> str:
+    """Fetch transcript using YouTubeTranscriptApi backed by curl_cffi Chrome impersonation."""
+    try:
+        sess_kwargs = {"impersonate": "chrome"}
+        proxy_dict = get_proxy_dict()
+        if proxy_dict:
+            sess_kwargs["proxies"] = proxy_dict
+        sess = CffiSession(**sess_kwargs)
+
+        api = YouTubeTranscriptApi(http_client=sess)
         transcript_list = api.list(video_id)
         transcript = None
-        for t in transcript_list:
-            transcript = t
-            break
-            
+        try:
+            transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB', 'en-IN'])
+        except Exception:
+            for t in transcript_list:
+                transcript = t
+                break
+                
         if transcript:
             snippets = transcript.fetch()
             text = " ".join([s.text for s in snippets if hasattr(s, 'text') or (isinstance(s, dict) and 'text' in s)])
@@ -104,28 +207,28 @@ def get_transcript_from_api(video_id: str) -> str:
         print(f"[YouTubeTranscriptApi] Note: {e}")
     return ""
 
-def get_transcript_from_ytdlp(clean_url: str, temp_dir: str) -> str:
-    """Try fetching subtitles/captions with yt-dlp using clean canonical URL."""
+def get_transcript_from_ytdlp(clean_url: str, temp_dir: str, cookies_path: Optional[str] = None) -> str:
+    """Try fetching subtitles/captions with yt-dlp using clean canonical URL with strict timeout."""
     try:
         ydl_opts = {
             'impersonate': ImpersonateTarget(client='chrome'),
             'skip_download': True,
             'writesubtitles': True,
             'writeautomaticsub': True,
-            'subtitleslangs': ['en', 'hi', 'en-US', 'en-IN'],
+            'subtitleslangs': ['all', 'en.*', 'hi.*', 'es.*'],
             'subtitlesformat': 'vtt',
             'outtmpl': os.path.join(temp_dir, 'subs.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
             'ignoreerrors': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios', 'tv'],
-                    'player_skip': ['configs']
-                }
-            }
+            'socket_timeout': 8,
         }
+        if PROXY_URL:
+            ydl_opts['proxy'] = PROXY_URL
+        if cookies_path and os.path.exists(cookies_path):
+            ydl_opts['cookiefile'] = cookies_path
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([clean_url])
             
@@ -155,36 +258,8 @@ def get_transcript_from_ytdlp(clean_url: str, temp_dir: str) -> str:
         print(f"[yt-dlp subtitle] Note: {e}")
         return ""
 
-def get_transcript_from_invidious(video_id: str) -> str:
-    """Fallback: Try fetching captions from public Invidious instances."""
-    instances = [
-        "https://inv.nadeko.net",
-        "https://invidious.nerdvpn.de",
-        "https://invidious.jing.rocks",
-        "https://vid.priv.au",
-        "https://invidious.no-logs.com",
-    ]
-    for inst in instances:
-        try:
-            url = f"{inst}/api/v1/captions/{video_id}"
-            r = requests.get(url, timeout=2.5)
-            if r.status_code == 200:
-                captions = r.json().get("captions", [])
-                for c in captions:
-                    sub_url = inst + c.get("url", "")
-                    sub_r = requests.get(sub_url, timeout=2.5)
-                    if sub_r.status_code == 200 and len(sub_r.text) > 100:
-                        # Strip VTT formatting
-                        cleaned = re.sub(r'WEBVTT.*?\n\n', '', sub_r.text, flags=re.DOTALL)
-                        cleaned = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}.*?\n', '', cleaned)
-                        cleaned = re.sub(r'<[^>]+>', '', cleaned)
-                        return " ".join(cleaned.split()).strip()
-        except Exception:
-            continue
-    return ""
-
-def extract_audio_and_transcribe_groq(clean_url: str, output_dir: str) -> str:
-    """Download audio track and transcribe in a single fast call with Groq Whisper."""
+def extract_audio_and_transcribe_groq(clean_url: str, output_dir: str, cookies_path: Optional[str] = None) -> str:
+    """Download audio track and transcribe in a single fast call with Groq Whisper with strict timeout."""
     if not client:
         return ""
     try:
@@ -193,18 +268,19 @@ def extract_audio_and_transcribe_groq(clean_url: str, output_dir: str) -> str:
         
         ydl_opts = {
             'impersonate': ImpersonateTarget(client='chrome'),
-            'format': 'ba/b/best',
+            'format': 'bestaudio[filesize<25M]/ba/b',
             'outtmpl': audio_raw_path,
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
             'ignoreerrors': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios', 'tv', 'web_safari']
-                }
-            }
+            'socket_timeout': 10,
         }
+        if PROXY_URL:
+            ydl_opts['proxy'] = PROXY_URL
+        if cookies_path and os.path.exists(cookies_path):
+            ydl_opts['cookiefile'] = cookies_path
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([clean_url])
             
@@ -224,7 +300,7 @@ def extract_audio_and_transcribe_groq(clean_url: str, output_dir: str) -> str:
             "-ac", "1", "-ar", "16000", "-b:a", "32k",
             compressed_audio_path
         ]
-        subprocess.run(compress_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+        subprocess.run(compress_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
         
         target_audio = compressed_audio_path if os.path.exists(compressed_audio_path) else audio_raw_path
         
@@ -236,7 +312,8 @@ def extract_audio_and_transcribe_groq(clean_url: str, output_dir: str) -> str:
             )
         return transcription.text.strip()
     except Exception as e:
-        print(f"[Whisper fallback error]: {e}")
+        error_msg = f"[Whisper fallback error]: {str(e)}"
+        print(error_msg)
         return ""
 
 def clean_llm_json(raw_text: str) -> Dict[str, Any]:
@@ -265,7 +342,7 @@ def clean_llm_json(raw_text: str) -> Dict[str, Any]:
                 pass
     return {}
 
-def extract_visual_frames(clean_url: str, video_id: str, visual_insights: list, output_dir: str) -> list:
+def extract_visual_frames(clean_url: str, video_id: str, visual_insights: list, output_dir: str, cookies_path: Optional[str] = None) -> list:
     """Extract visual frame snapshots using yt-dlp and ffmpeg."""
     import base64
     results = []
@@ -277,12 +354,12 @@ def extract_visual_frames(clean_url: str, video_id: str, visual_insights: list, 
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'tv', 'web_safari']
-            }
-        }
+        'socket_timeout': 8,
     }
+    if PROXY_URL:
+        ydl_opts['proxy'] = PROXY_URL
+    if cookies_path and os.path.exists(cookies_path):
+        ydl_opts['cookiefile'] = cookies_path
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -347,26 +424,33 @@ async def process_video(request: VideoRequest):
             transcript_text = direct_text
             
             if not transcript_text and clean_url:
+                cookies_path = setup_cookies(temp_dir)
                 yield f"data: {json.dumps({'status': 'progress', 'message': 'Fetching video transcript and subtitles...'})}\n\n"
                 
-                # 1. Try YouTubeTranscriptApi
-                transcript_text = await asyncio.to_thread(get_transcript_from_api, video_id)
+                # 1. Try Direct Innertube API with Chrome TLS impersonation (Fastest, ~1s)
+                transcript_text = await asyncio.to_thread(get_transcript_from_innertube, video_id, cookies_path)
                 
-                # 2. Try yt-dlp clean subtitle extraction
+                # 2. Try YouTubeTranscriptApi with Chrome TLS impersonation
                 if not transcript_text:
-                    transcript_text = await asyncio.to_thread(get_transcript_from_ytdlp, clean_url, temp_dir)
+                    transcript_text = await asyncio.to_thread(get_transcript_from_api, video_id)
                     
-                # 3. Try Invidious mirror extraction
+                # 3. Try yt-dlp clean subtitle extraction
                 if not transcript_text:
-                    transcript_text = await asyncio.to_thread(get_transcript_from_invidious, video_id)
+                    transcript_text = await asyncio.to_thread(get_transcript_from_ytdlp, clean_url, temp_dir, cookies_path)
                     
                 # 4. Try Whisper Audio Transcription
-                if not transcript_text:
+                if not transcript_text and client:
                     yield f"data: {json.dumps({'status': 'progress', 'message': 'Subtitles not directly available. Transcribing audio with Groq Whisper...'})}\n\n"
-                    transcript_text = await asyncio.to_thread(extract_audio_and_transcribe_groq, clean_url, temp_dir)
+                    transcript_text = await asyncio.to_thread(extract_audio_and_transcribe_groq, clean_url, temp_dir, cookies_path)
 
             if not transcript_text:
-                yield f"data: {json.dumps({'status': 'error', 'message': 'Could not extract transcript from YouTube. YouTube is temporarily rate-limiting automated requests. You can paste the transcript or notes text directly in the Text tab!'})}\n\n"
+                error_msg = (
+                    "Could not extract transcript from YouTube. Cloud hosting providers (like Render/AWS) "
+                    "are often rate-limited or blocked by YouTube's anti-bot system. "
+                    "You can paste the transcript or notes text directly in the 'Paste Notes / Transcript' tab! "
+                    "(Tip: On YouTube, click '... More' under the video title -> 'Show transcript' to copy it in 5 seconds!)"
+                )
+                yield f"data: {json.dumps({'status': 'error', 'message': error_msg})}\n\n"
                 return
 
             yield f"data: {json.dumps({'status': 'progress', 'message': 'AI is analyzing concepts, generating study notes, and creating quiz...'})}\n\n"
@@ -376,23 +460,24 @@ async def process_video(request: VideoRequest):
             truncated_transcript = transcript_text[:max_chars]
 
             system_prompt = f"""You are an elite academic professor and master tutor.
-Transform the following educational transcript into high-yield, structured study material.
+Transform the following educational video transcript into exhaustive, high-yield, deeply detailed study material. Leave no important concept, technical mechanism, formula, definition, or explanation omitted.
 Write the entire output in {request.language}.
 
 You MUST respond strictly with valid JSON inside a ```json ... ``` codeblock using this exact format:
 ```json
 {{
   "title": "Clear, informative topic title",
-  "summary": "Detailed 3-4 paragraph structured explanation covering core concepts, mechanisms, advantages, disadvantages, and real-world exam context.",
+  "summary": "Exhaustive, deeply detailed 4-5 paragraph structured explanation thoroughly covering every concept, technical mechanism, process, advantage, disadvantage, formula, and real-world exam context taught in the video.",
   "key_points": [
-    "Core takeaway 1 with clear explanation",
-    "Core takeaway 2 with clear explanation",
-    "Core takeaway 3 with clear explanation",
-    "Core takeaway 4 with clear explanation"
+    "Comprehensive key concept 1 with in-depth explanation",
+    "Comprehensive key concept 2 with in-depth explanation",
+    "Comprehensive key concept 3 with in-depth explanation",
+    "Comprehensive key concept 4 with in-depth explanation",
+    "Comprehensive key concept 5 with in-depth explanation"
   ],
   "visual_insights": [
-    {{"timestamp": "01:30", "description": "Key visual diagram or architecture explained at this point"}},
-    {{"timestamp": "04:15", "description": "Formula, code, or workflow visual concept"}}
+    {{"timestamp": "01:30", "description": "Key visual diagram, slide, code, or architecture explained at this point"}},
+    {{"timestamp": "04:15", "description": "Key formula, diagram, or workflow visual concept"}}
   ],
   "quiz": [
     {{
@@ -468,7 +553,7 @@ Ensure exactly 5 high-yield quiz questions with detailed explanations. Do not in
             # Prepare visual cards
             visuals = parsed_json.get("visual_insights", [])
             if visuals and video_id:
-                parsed_json["visual_insights"] = extract_visual_frames(clean_url, video_id, visuals, temp_dir)
+                parsed_json["visual_insights"] = extract_visual_frames(clean_url, video_id, visuals, temp_dir, cookies_path)
                 
             parsed_json["status"] = "completed"
             yield f"data: {json.dumps(parsed_json)}\n\n"

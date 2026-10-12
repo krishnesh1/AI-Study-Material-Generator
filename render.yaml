@@ -12,3 +12,7 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: YOUTUBE_PROXY
+        sync: false
+      - key: YOUTUBE_COOKIES
+        sync: false

@@ -15,7 +15,9 @@ import {
   Download, 
   Video, 
   AlignLeft,
-  RefreshCw
+  RefreshCw,
+  ExternalLink,
+  Info
 } from "lucide-react";
 
 const PROCESSING_STEPS = [
@@ -378,21 +380,47 @@ export default function Home() {
             exit={{ opacity: 0, height: 0 }}
             className="max-w-3xl mx-auto px-4 py-6"
           >
-            <div className="bg-red-500/10 border border-red-500/20 text-red-700 dark:text-red-300 rounded-2xl p-6 shadow-sm flex flex-col gap-4">
+            <div className="bg-amber-500/10 border border-amber-500/20 text-amber-900 dark:text-amber-200 rounded-2xl p-6 shadow-sm flex flex-col gap-4">
               <div>
-                <h3 className="text-lg font-semibold mb-1">Processing Notice</h3>
-                <p className="text-sm leading-relaxed">{error}</p>
+                <h3 className="text-lg font-semibold mb-1 flex items-center gap-2">
+                  <Info className="w-5 h-5 text-amber-500" />
+                  YouTube Cloud Extraction Notice
+                </h3>
+                <p className="text-sm leading-relaxed text-[var(--foreground)] opacity-90">{error}</p>
               </div>
-              <div className="flex gap-3">
+
+              {/* Quick 3-Step Guide */}
+              <div className="bg-[var(--card)]/80 border border-[var(--border)] rounded-xl p-4 text-sm text-[var(--foreground)]">
+                <p className="font-semibold text-blue-600 dark:text-blue-400 mb-2">⚡ How to continue in 5 seconds:</p>
+                <ol className="list-decimal list-inside space-y-1 opacity-90 text-xs sm:text-sm">
+                  <li>Open the video on YouTube</li>
+                  <li>Click <span className="font-semibold">"... More"</span> below the video title → <span className="font-semibold">"Show transcript"</span></li>
+                  <li>Click <span className="font-semibold">"Switch to Direct Text / Notes Tab"</span> below, paste the transcript, and click Generate!</li>
+                </ol>
+              </div>
+
+              <div className="flex flex-wrap gap-3">
                 <button
                   onClick={() => { setInputMode("text"); setError(null); }}
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-xl transition-all cursor-pointer"
+                  className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-xl transition-all cursor-pointer shadow-sm shadow-blue-500/20 flex items-center gap-2"
                 >
+                  <AlignLeft className="w-4 h-4" />
                   Switch to Direct Text / Notes Tab
                 </button>
+                {url.trim() && (
+                  <a
+                    href={url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-4 py-2.5 bg-[var(--card)] border border-[var(--border)] text-sm font-medium rounded-xl hover:bg-[var(--muted)] transition-all flex items-center gap-1.5 cursor-pointer no-underline text-[var(--foreground)]"
+                  >
+                    <ExternalLink className="w-4 h-4" />
+                    Open Video on YouTube
+                  </a>
+                )}
                 <button
                   onClick={() => processVideo()}
-                  className="px-4 py-2 bg-[var(--card)] border border-[var(--border)] text-sm font-medium rounded-xl hover:bg-[var(--muted)] transition-all flex items-center gap-1.5 cursor-pointer"
+                  className="px-4 py-2.5 bg-[var(--card)] border border-[var(--border)] text-sm font-medium rounded-xl hover:bg-[var(--muted)] transition-all flex items-center gap-1.5 cursor-pointer"
                 >
                   <RefreshCw className="w-3.5 h-3.5" />
                   Retry

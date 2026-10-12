@@ -44,3 +44,12 @@ npm run dev
 ```
 
 Visit `http://localhost:3000` in your browser!
+
+## Cloud Deployment & YouTube Rate-Limiting ☁️
+
+When deploying to cloud providers (Render, AWS, Railway), YouTube frequently blocks datacenter IP ranges from automated downloading.
+
+To ensure 100% reliability in production:
+1. **Direct Text Tab (Zero Configuration):** Users can paste video transcripts or lecture notes directly in the "Paste Notes / Transcript" tab. On YouTube, click `... More` below the video title → `Show transcript` to copy it in 5 seconds.
+2. **Proxy Support:** Add `YOUTUBE_PROXY` (e.g. from Webshare, Smartproxy, or any residential proxy) to your Render / cloud environment variables.
+3. **Cookie Authentication:** Set `YOUTUBE_COOKIES` in your environment variables (or place a `cookies.txt` file in the backend directory) using cookies exported from your browser.
