@@ -16,3 +16,5 @@ services:
         sync: false
       - key: YOUTUBE_COOKIES
         sync: false
+      - key: SUPADATA_API_KEY
+        sync: false

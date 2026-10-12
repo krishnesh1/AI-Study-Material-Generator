@@ -28,6 +28,7 @@ load_dotenv()
 PROXY_URL = os.environ.get("YOUTUBE_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY") or None
 COOKIES_ENV = os.environ.get("YOUTUBE_COOKIES", "").strip()
 COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY", "").strip()
 
 def get_proxy_dict() -> Optional[Dict[str, str]]:
     """Return dictionary of proxies if configured in environment."""
@@ -205,6 +206,25 @@ def get_transcript_from_api(video_id: str) -> str:
             return text.strip()
     except Exception as e:
         print(f"[YouTubeTranscriptApi] Note: {e}")
+    return ""
+
+def get_transcript_from_supadata(video_id: str) -> str:
+    """Fallback: Fetch transcript using Supadata API if SUPADATA_API_KEY is configured."""
+    if not SUPADATA_API_KEY:
+        return ""
+    try:
+        url = f"https://api.supadata.ai/v1/youtube/transcript?videoId={video_id}"
+        headers = {"x-api-key": SUPADATA_API_KEY}
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            content = data.get("content", [])
+            if isinstance(content, list):
+                return " ".join([c.get("text", "") for c in content if isinstance(c, dict)]).strip()
+            elif isinstance(content, str):
+                return content.strip()
+    except Exception as e:
+        print(f"[Supadata API] Note: {e}")
     return ""
 
 def get_transcript_from_ytdlp(clean_url: str, temp_dir: str, cookies_path: Optional[str] = None) -> str:
@@ -434,11 +454,15 @@ async def process_video(request: VideoRequest):
                 if not transcript_text:
                     transcript_text = await asyncio.to_thread(get_transcript_from_api, video_id)
                     
-                # 3. Try yt-dlp clean subtitle extraction
+                # 3. Try Supadata API (if configured in environment)
+                if not transcript_text and SUPADATA_API_KEY:
+                    transcript_text = await asyncio.to_thread(get_transcript_from_supadata, video_id)
+
+                # 4. Try yt-dlp clean subtitle extraction
                 if not transcript_text:
                     transcript_text = await asyncio.to_thread(get_transcript_from_ytdlp, clean_url, temp_dir, cookies_path)
                     
-                # 4. Try Whisper Audio Transcription
+                # 5. Try Whisper Audio Transcription
                 if not transcript_text and client:
                     yield f"data: {json.dumps({'status': 'progress', 'message': 'Subtitles not directly available. Transcribing audio with Groq Whisper...'})}\n\n"
                     transcript_text = await asyncio.to_thread(extract_audio_and_transcribe_groq, clean_url, temp_dir, cookies_path)
